@@ -550,5 +550,6 @@ POSITIONAL_FIELD_ORDER = (
     "prefill_decode_interval_min_bs",
     "unified_cache_external_linker_config",
     "elastic_ep_retiree_lifecycle",
+    "elastic_ep_reuse_cuda_graph",
 )
 # fmt: on
