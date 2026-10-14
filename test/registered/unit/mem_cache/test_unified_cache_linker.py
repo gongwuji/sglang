@@ -98,7 +98,7 @@ class _FakeLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         return self.load_landed
 
-    def offload(self, transfers, session_id=None):
+    def offload(self, node_id, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
         self.offload_sessions.append(session_id)
         return True
@@ -316,7 +316,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             self.queued_loads.pop(rid, None)
         return self.load_landed
 
-    def offload(self, transfers, session_id=None):
+    def offload(self, node_id, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)
