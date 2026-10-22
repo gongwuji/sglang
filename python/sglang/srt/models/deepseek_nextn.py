@@ -14,6 +14,7 @@
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
+import copy
 import logging
 import os
 from contextlib import ExitStack
@@ -36,6 +37,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -287,6 +289,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
+        # The draft layer stays in checkpoint precision. Copy so a config shared with
+        # the target model keeps its own exclusions.
+        if isinstance(nextn_quant_config, ModelOptQuantConfig):
+            nextn_quant_config = copy.copy(nextn_quant_config)
+            nextn_quant_config.update_online_fp8_exclude_modules(("*",))
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
