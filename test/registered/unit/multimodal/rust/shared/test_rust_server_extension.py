@@ -164,6 +164,7 @@ class TestRustServerExtension(CustomTestCase):
 
         scheduler = SimpleNamespace(
             server_args=sentinel.server_args,
+            processor=sentinel.processor,
             model_config=SimpleNamespace(
                 is_multimodal=True,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
