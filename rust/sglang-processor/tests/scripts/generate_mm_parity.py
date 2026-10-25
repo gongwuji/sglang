@@ -14,7 +14,7 @@ import argparse
 import asyncio
 import hashlib
 import io
-import sys
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,9 +34,6 @@ from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
 from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.utils.hf_transformers.processor import get_processor  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).parent))
-from fixture_json import dump  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "mm_parity"
 IMAGES = FIXTURES / "images"
@@ -247,6 +244,17 @@ class PythonPath:
             "mrope_sha256": sha256(output.mrope_positions.cpu().numpy().astype("<i8")),
             "mrope_delta": int(output.mrope_position_delta.item()),
         }
+
+
+def dump(fixture):
+    """The fixture's fields one per line, and each case on one line."""
+    lines = [
+        f"  {json.dumps(key)}: {json.dumps(value)}"
+        for key, value in fixture.items()
+        if key != "cases"
+    ]
+    cases = ",\n".join(f"    {json.dumps(case)}" for case in fixture["cases"])
+    return "{\n" + ",\n".join(lines) + ',\n  "cases": [\n' + cases + "\n  ]\n}\n"
 
 
 def sha256(array):
