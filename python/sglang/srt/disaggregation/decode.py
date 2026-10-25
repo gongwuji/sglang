@@ -362,6 +362,9 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
     host_staged: bool = False
+    # Overlap: (ready event, send_metadata args, kwargs) until the forward in
+    # flight at allocation time is done.
+    pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1836,12 +1839,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
             )
-        decode_req.kv_receiver.send_metadata(
-            page_indices,
-            decode_req.metadata_buffer_index,
-            state_indices,
-            **metadata_kwargs,
-        )
+        args = (page_indices, decode_req.metadata_buffer_index, state_indices)
+        if (
+            self.scheduler.enable_overlap
+            and metadata_kwargs.get("destination") != KVTransferDestination.HOST
+        ):
+            # A request that finished last step can still have its forward in
+            # flight, writing pages this request was just given. Prefill's RDMA
+            # into them follows no stream, so send once that forward is done.
+            ready = self.scheduler.device_module.Event()
+            ready.record(stream=self.scheduler.forward_stream)
+            decode_req.pending_metadata = (ready, args, metadata_kwargs)
+        else:
+            decode_req.kv_receiver.send_metadata(*args, **metadata_kwargs)
         if (
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
@@ -2782,6 +2792,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
+
+        for decode_req in self.queue:
+            pending = decode_req.pending_metadata
+            if pending is not None and pending[0].query():
+                decode_req.pending_metadata = None
+                decode_req.kv_receiver.send_metadata(*pending[1], **pending[2])
 
         if self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(

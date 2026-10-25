@@ -527,6 +527,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         hicache_restore_lock=None,
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        pending_metadata=None,
     )
 
 
@@ -851,6 +852,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         metadata_buffer_index=idx,
         hicache_restore_status=None,
         host_staged=False,
+        pending_metadata=None,
     )
 
 
