@@ -46,6 +46,9 @@ class MultimodalProcessorMixin:
     precompute_hash_before_cpu_transfer = False
     keep_mm_features_on_device = False
 
+    def _io_thread_initializer(self):
+        return None
+
     def _initialize_processor(
         self, hf_config, _processor, *, processor_config, **kwargs
     ):
@@ -63,6 +66,7 @@ class MultimodalProcessorMixin:
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
         mm_process_config = processor_config.mm_process_config
+        self.mm_process_config = mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
@@ -98,6 +102,7 @@ class MultimodalProcessorMixin:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
+            initializer=self._io_thread_initializer(),
         )
         if self.mm_io_worker_num > 4:
             logger.info(
@@ -156,6 +161,12 @@ class MultimodalProcessorMixin:
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """Worker count when none is requested; serving overrides this."""
         return 1
+
+    async def _run_mm_processor(self, function, **kwargs):
+        # The function always gets a processor: a worker's clone, or the original inline.
+        if self.mm_processor_executor is None:
+            return function(processor=self._processor, **kwargs)
+        return await self.mm_processor_executor.run(function, **kwargs)
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
