@@ -237,6 +237,42 @@ class _HintSupersetTransport(_StrictPeerTransport):
         ]
 
 
+class _SourceInventoryTransport(_HintSupersetTransport):
+    """Model a logical router superset with exact peer-pool residency probes."""
+
+    def __init__(self, layouts, peers):
+        super().__init__(layouts, peers)
+        self.probes = []
+
+    def query(self, keys, request_id=None):
+        return [
+            (
+                status,
+                SimpleNamespace(name="REMOTE_G2")
+                if status == _QueryStatus.FETCHABLE
+                else tier,
+            )
+            for status, tier in super().query(keys, request_id)
+        ]
+
+    def probe_remote_source(self, keys, request_id, expected_layout):
+        self.probes.append(tuple(keys))
+        endpoint = self.hints[request_id]["actions"][0]["payload"][
+            "source_control_endpoint"
+        ]
+        source = self.peers[endpoint]
+        return self._complete(
+            {
+                key: SimpleNamespace(
+                    success=all(
+                        label in source.get(key, {}) for label in expected_layout
+                    )
+                )
+                for key in keys
+            }
+        )
+
+
 class _BoundedCopyTransport(_CopyTransport):
     """External bounded LRU with the native API's tail-first alignment contract."""
 
@@ -2015,6 +2051,82 @@ class TestKVCRStorage(CustomTestCase):
         )
         self.assertEqual(result.restorable_prefix_pages, [1, 3])
         self.assertEqual(result.kv_hit_pages, 3)
+
+    def test_router_superset_does_not_admit_missing_peer_mamba_checkpoint(self):
+        """A full-KV router hint cannot validate an absent middle Mamba state.
+
+        This is the unsalted GLM-5.3-Flash failure: logical pages match, but
+        only the final physical source checkpoint exists. The source inventory
+        probe must remove middle boundaries before rank consensus or fetch.
+        """
+        self.backend._runner = None
+        self.backend.register_mem_host_pool_v2(_HostPool(sizes=(9, 3)), PoolName.MAMBA)
+        self.backend._namespace = storage_namespace(self.config, self.backend._layouts)
+        endpoint = "tcp://peer:32100"
+        source = {
+            block_key(key, self.backend._namespace, "kv"): {} for key in self.keys
+        }
+        final_mamba = block_key(self.keys[-1], self.backend._namespace, "mamba")
+        source[final_mamba] = {
+            component.name: b"ready"
+            for component in self.backend._layouts["mamba"].components
+        }
+        self.backend._runner = transport = _SourceInventoryTransport(
+            self.backend._layouts, {endpoint: source}
+        )
+        hint = HiCacheStorageExtraInfo(
+            extra_info={
+                "kv_hints": {
+                    "protocol_version": "0.1",
+                    "actions": [
+                        {
+                            "action_type": "kv.fetch",
+                            "action_version": "1.0",
+                            "payload": {
+                                "source_control_endpoint": endpoint,
+                                "block_hashes": [
+                                    int(key[:16], 16) for key in self.keys
+                                ],
+                            },
+                        }
+                    ],
+                }
+            }
+        )
+        result = self.backend.batch_exists_v2(
+            self.keys,
+            [
+                PoolTransfer(
+                    PoolName.MAMBA,
+                    keys=self.keys[-1:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+            extra_info=hint,
+        )
+        self.assertEqual(result.restorable_prefix_pages, [4])
+        self.assertEqual(result.kv_hit_pages, 4)
+        self.assertEqual(len(transport.probes), 1)
+        self.assertIn(final_mamba, transport.probes[0])
+        self.assertFalse(transport.fetches)
+
+        # An older KVCR runtime has no source-inventory protocol. Its remote
+        # hint must not promote even the full boundary without physical proof.
+        transport.probe_remote_source = None
+        unproven = self.backend.batch_exists_v2(
+            self.keys,
+            [
+                PoolTransfer(
+                    PoolName.MAMBA,
+                    keys=self.keys[-1:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+            extra_info=hint,
+        )
+        self.assertEqual(unproven.restorable_prefix_pages, [])
+        self.assertEqual(unproven.kv_hit_pages, 0)
+        self.assertFalse(transport.fetches)
 
     def test_invalid_physical_pages_are_rejected_before_io(self):
         layout = describe_pool("kv", self.pool)

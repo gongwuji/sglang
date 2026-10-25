@@ -816,7 +816,52 @@ class KVCRStore(HiCacheStorage):
                 for key in keys
             ]
             with self._hint(extra_info, identities) as request_id:
-                statuses = self._runner.query(identities, request_id=request_id)
+                statuses = list(self._runner.query(identities, request_id=request_id))
+                probe = getattr(self._runner, "probe_remote_source", None)
+                # Router hints describe logical pages, not which trailing
+                # checkpoints the chosen peer can physically supply. Check
+                # all candidate keys in bounded batches before publishing
+                # legal boundaries. The later fetch still claims the exact
+                # selected checkpoint and catches eviction after this probe.
+                for transfer_index, transfer in enumerate(required):
+                    if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+                        continue
+                    name = str(transfer.name)
+                    layout = self._layouts.get(name)
+                    if layout is None:
+                        continue
+                    remote_indices = [
+                        index
+                        for index in range(
+                            transfer_index * len(keys),
+                            (transfer_index + 1) * len(keys),
+                        )
+                        if statuses[index][0] == QueryStatus.FETCHABLE
+                        and getattr(statuses[index][1], "name", None) == "REMOTE_G2"
+                    ]
+                    if not remote_indices:
+                        continue
+                    if request_id is None or not callable(probe):
+                        # Older KVCR peers cannot prove remote Mamba residency.
+                        # Preserve local/G3 hits but never admit these hints.
+                        for index in remote_indices:
+                            statuses[index] = (QueryStatus.MISS, None)
+                        continue
+                    labels = [part.name for part in layout.components]
+                    for start in range(0, len(remote_indices), 256):
+                        indices = remote_indices[start : start + 256]
+                        candidates = [identities[index] for index in indices]
+                        result = self._wait(
+                            probe(
+                                candidates,
+                                request_id=request_id,
+                                expected_layout=labels,
+                            )
+                        )
+                        for index in indices:
+                            entry = result.get(identities[index])
+                            if entry is None or not entry.success:
+                                statuses[index] = (QueryStatus.MISS, None)
         restorable, hits = set(range(1, len(keys) + 1)), {}
         for index, transfer in enumerate(required):
             status = statuses[index * len(keys) : (index + 1) * len(keys)]
