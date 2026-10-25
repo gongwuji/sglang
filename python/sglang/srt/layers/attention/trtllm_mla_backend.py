@@ -1579,11 +1579,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q = cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
             else:
-                # draft_extend: handle varying num_correct_drafts_per_req. If total_tokens % bs == 0,
-                # we can directly reshape q; otherwise, pad to max_seq_len_q.
+                # The sum equals bs * max only when all request lengths match.
                 total_tokens = q.shape[0]
                 tokens_per_seq = total_tokens // bs if bs > 0 else 0
-                can_direct_view = bs > 0 and (total_tokens % bs == 0)
+                can_direct_view = (
+                    bs > 0
+                    and total_tokens
+                    == metadata.sum_seq_lens_q
+                    == bs * metadata.max_seq_len_q
+                )
 
                 if can_direct_view:
                     max_seq_len = metadata.max_seq_len_k + tokens_per_seq
@@ -1591,19 +1595,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     needs_unpad = False
                 else:
                     # Varying lengths: pad q to (bs, max_seq_len_q, ...)
-                    actual_seq_lens_q = forward_batch.extend_seq_lens
-                    actual_max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                    actual_seq_lens_q = metadata.seq_lens_q
+                    actual_max_seq_len_q = metadata.max_seq_len_q
                     max_seq_len = metadata.max_seq_len_k + actual_max_seq_len_q
 
-                    actual_cu_seqlens_q = torch.nn.functional.pad(
-                        torch.cumsum(actual_seq_lens_q, dim=0, dtype=torch.int32),
-                        (1, 0),
-                    )
+                    actual_cu_seqlens_q = metadata.cu_seqlens_q
 
                     if self.padded_q_buffer is not None:
-                        padded_q = self.padded_q_buffer[
-                            :bs, :actual_max_seq_len_q, :, :
-                        ].to(dtype=q.dtype)
+                        # The padding kernel requires packed rows even when
+                        # the captured request width exceeds this batch's.
+                        padded_q = (
+                            self.padded_q_buffer.flatten(0, 1)[
+                                : bs * actual_max_seq_len_q
+                            ]
+                            .view(
+                                bs,
+                                actual_max_seq_len_q,
+                                layer.tp_q_head_num,
+                                layer.head_dim,
+                            )
+                            .to(dtype=q.dtype)
+                        )
                         padded_q.zero_()
                     else:
                         padded_q = torch.zeros(
