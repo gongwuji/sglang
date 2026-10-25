@@ -139,6 +139,11 @@ def _ltx2_try_fused_qknorm_split_rope(
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
 
 
+def _child_prefix(prefix: str, name: str) -> str:
+    """Checkpoint-relative module path for per-layer quantization lookups."""
+    return f"{prefix}.{name}" if prefix else ""
+
+
 @dataclass(slots=True)
 class LTX2PromptKV:
     """One block's prompt cross-attention (K, V) with K normed, fixed for a denoising loop"""
@@ -751,6 +756,7 @@ class LTX2Attention(nn.Module):
         required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
+        quant_prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -790,6 +796,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=_child_prefix(quant_prefix, "to_q"),
         )
         self.to_k = ColumnParallelLinear(
             self.context_dim,
@@ -797,6 +804,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=_child_prefix(quant_prefix, "to_k"),
         )
         self.to_v = ColumnParallelLinear(
             self.context_dim,
@@ -804,6 +812,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=_child_prefix(quant_prefix, "to_v"),
         )
         self.to_gate_logits: ColumnParallelLinear | None = None
         if self.apply_gated_attention:
@@ -813,6 +822,7 @@ class LTX2Attention(nn.Module):
                 bias=True,
                 gather_output=False,
                 quant_config=quant_config,
+                prefix=_child_prefix(quant_prefix, "to_gate_logits"),
             )
 
         self.q_norm: nn.Module | None = None
@@ -844,6 +854,7 @@ class LTX2Attention(nn.Module):
                 bias=True,
                 input_is_parallel=True,
                 quant_config=quant_config,
+                prefix=_child_prefix(quant_prefix, "to_out.0"),
             ),
             nn.Identity(),
         )
@@ -1100,6 +1111,7 @@ class LTX2FeedForward(nn.Module):
         mult: int = 4,
         bias: bool = True,
         quant_config: QuantizationConfig | None = None,
+        quant_prefix: str = "",
     ) -> None:
         super().__init__()
         if dim_out is None:
@@ -1107,7 +1119,12 @@ class LTX2FeedForward(nn.Module):
         inner_dim = int(dim * mult)
 
         self.proj_in = ColumnParallelLinear(
-            dim, inner_dim, bias=bias, gather_output=False, quant_config=quant_config
+            dim,
+            inner_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=_child_prefix(quant_prefix, "proj_in"),
         )
         self.act = nn.GELU(approximate="tanh")
         self.proj_out = RowParallelLinear(
@@ -1116,6 +1133,7 @@ class LTX2FeedForward(nn.Module):
             bias=bias,
             input_is_parallel=True,
             quant_config=quant_config,
+            prefix=_child_prefix(quant_prefix, "proj_out"),
         )
         FUSED_LINEAR_GELU.mark(self, "proj_in")
 
@@ -1153,6 +1171,7 @@ class LTX2TransformerBlock(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
+        quant_prefix: str = "",
     ):
         super().__init__()
         self.idx = idx
@@ -1174,6 +1193,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn1",
             quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "attn1"),
         )
         self.audio_attn1 = LTX2Attention(
             query_dim=audio_dim,
@@ -1186,6 +1206,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_attn1",
             quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "audio_attn1"),
         )
 
         # 2. Prompt Cross-Attention
@@ -1203,6 +1224,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn2",
             quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "attn2"),
         )
         self.audio_attn2 = LTX2Attention(
             query_dim=audio_dim,
@@ -1216,6 +1238,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_attn2",
             quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "audio_attn2"),
         )
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
@@ -1232,6 +1255,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_to_video_attn",
             quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "audio_to_video_attn"),
         )
         self.video_to_audio_attn = LTX2Attention(
             query_dim=audio_dim,
@@ -1251,16 +1275,25 @@ class LTX2TransformerBlock(nn.Module):
             ),
             prefix=f"{prefix}.video_to_audio_attn",
             quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "video_to_audio_attn"),
         )
 
         # 4. Feedforward layers
         # LTX-2.5: `ff_bias: false`, `audio_ff_bias: true`.
         self.ff = LTX2FeedForward(
-            dim, dim_out=dim, bias=ff_bias, quant_config=quant_config
+            dim,
+            dim_out=dim,
+            bias=ff_bias,
+            quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "ff"),
         )
         LTX2_RMS_NORM_MODULATE.mark(self)
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, bias=audio_ff_bias, quant_config=quant_config
+            audio_dim,
+            dim_out=audio_dim,
+            bias=audio_ff_bias,
+            quant_config=quant_config,
+            quant_prefix=_child_prefix(quant_prefix, "audio_ff"),
         )
 
         # 5. Modulation Parameters
@@ -1701,6 +1734,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="patchify_proj",
         )
         self.audio_patchify_proj = ColumnParallelLinear(
             arch.audio_in_channels,
@@ -1708,6 +1742,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="audio_patchify_proj",
         )
 
         # Marks single-pixel-frame keyframe tokens. Zero-initialized upstream
@@ -1911,6 +1946,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=config.prefix,
                     quant_config=quant_config,
+                    quant_prefix=f"transformer_blocks.{idx}",
                 )
                 for idx in range(arch.num_layers)
             ]
@@ -1926,6 +1962,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="proj_out",
         )
 
         self.audio_norm_out = nn.LayerNorm(
@@ -1937,6 +1974,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="audio_proj_out",
         )
 
         self.out_channels_raw = arch.out_channels // (
