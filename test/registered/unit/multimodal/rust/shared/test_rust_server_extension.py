@@ -333,6 +333,14 @@ class TestRustServerExtension(CustomTestCase):
             extension.Server.assert_not_called()
 
             mm_processor.return_value.resolve_spec.return_value = sentinel.spec
+            # Rust refusing the model's processor config refuses it before bind too.
+            with patch.object(
+                BuiltinServer, "_build_mm_spec", side_effect=ValueError("mm pipeline")
+            ):
+                with self.assertRaisesRegex(ValueError, "mm pipeline"):
+                    BuiltinServer.launch(scheduler)
+            extension.Server.assert_not_called()
+
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()
