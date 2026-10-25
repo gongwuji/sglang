@@ -4,12 +4,14 @@ import copy
 import ctypes
 import json
 import mmap
+import sys
 import types
 import unittest
 from array import array
 from contextlib import ExitStack
 from contextlib import nullcontext
 from enum import Enum
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -41,7 +43,10 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
-from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+from sglang.srt.mem_cache.storage.kvcr.kvcr_store import (
+    KVCRStore,
+    _allocate_dram_pool,
+)
 from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
@@ -1244,6 +1249,52 @@ class TestKVCRStorage(CustomTestCase):
                     finally:
                         for allocation in mappings:
                             allocation.close()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux smaps policy")
+    def test_private_dram_pool_excludes_thp_without_disabling_worker_thp(self):
+        """A plain anonymous mmap can be THP-eligible and stall source writes.
+
+        The KVCR pool alone must request ordinary pages; process-wide THP
+        remains unchanged for model allocations.
+        """
+        if not (
+            hasattr(mmap, "MAP_PRIVATE")
+            and hasattr(mmap, "MAP_ANONYMOUS")
+            and hasattr(mmap, "MADV_NOHUGEPAGE")
+        ):
+            self.skipTest("Pool-local MADV_NOHUGEPAGE is unavailable")
+        before = Path("/proc/self/status").read_text()
+        allocation = _allocate_dram_pool(2 << 20)
+        try:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
+            mapping = []
+            inside = False
+            for line in Path("/proc/self/smaps").read_text().splitlines():
+                if "-" in line.split(" ", 1)[0]:
+                    bounds = line.split(" ", 1)[0]
+                    start, end = (int(value, 16) for value in bounds.split("-"))
+                    if inside:
+                        break
+                    inside = start <= address < end
+                if inside:
+                    mapping.append(line)
+            self.assertTrue(mapping, "KVCR pool VMA was not found")
+            self.assertIn("rw-p", mapping[0])
+            flags = next(line for line in mapping if line.startswith("VmFlags:"))
+            self.assertIn("nh", flags.split())
+            self.assertNotIn("hg", flags.split())
+            eligible = next(line for line in mapping if line.startswith("THPeligible:"))
+            self.assertEqual(eligible.split()[1], "0")
+            current_thp = (
+                Path("/proc/self/status")
+                .read_text()
+                .split("THP_enabled:")[1]
+                .split()[0]
+            )
+            previous_thp = before.split("THP_enabled:")[1].split()[0]
+            self.assertEqual(current_thp, previous_thp)
+        finally:
+            allocation.close()
 
     def test_byte_verification_covers_every_successful_page_component(self):
         """Diagnostic digests follow physical bytes, not slot IDs or only primary KV."""

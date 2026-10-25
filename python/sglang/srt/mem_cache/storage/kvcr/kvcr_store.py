@@ -58,6 +58,19 @@ _TRAILING_POOLS = frozenset(
 )
 
 
+def _allocate_dram_pool(length):
+    """Keep KVCR's private DRAM pool off THP without changing worker-wide THP."""
+    if not hasattr(mmap, "MAP_PRIVATE") or not hasattr(mmap, "MAP_ANONYMOUS"):
+        return mmap.mmap(-1, length)
+    allocation = mmap.mmap(-1, length, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    if hasattr(allocation, "madvise") and hasattr(mmap, "MADV_NOHUGEPAGE"):
+        try:
+            allocation.madvise(mmap.MADV_NOHUGEPAGE)
+        except OSError:
+            logger.debug("KVCR DRAM ordinary-page advice unavailable", exc_info=True)
+    return allocation
+
+
 class _NoFrameworkPinning:
     """Answer misses when a peer asks for a non-KVCR-owned source."""
 
@@ -266,7 +279,7 @@ class KVCRStore(HiCacheStorage):
         with ExitStack() as resources:
             resources.callback(channel.close)
             for name, length in plans:
-                allocation = mmap.mmap(-1, length)
+                allocation = _allocate_dram_pool(length)
                 resources.callback(allocation.close)
                 mappings.append(allocation)
                 address = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
