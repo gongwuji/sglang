@@ -5,6 +5,7 @@ use std::sync::Arc;
 use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 
+use super::legacy::infer_legacy_template_from_model_path;
 use super::{ChatFormatter, ThinkingTemplates, load_chat_formatter};
 use crate::model_files::{resolve_chat_template_file, resolve_model_file, resolve_tokenizer_file};
 
@@ -98,9 +99,17 @@ pub fn select_chat_formatter(
             );
         }
     }
-    let discovered_template = config
-        .chat_template
-        .is_none()
+    // Python's `load_chat_template` guesses a legacy template from the model
+    // path before it reads the checkpoint's own template.
+    let legacy_model = || {
+        !config.model_path.is_empty()
+            && infer_legacy_template_from_model_path(
+                &config.model_path,
+                identity.model_type.as_deref(),
+            )
+            .is_some()
+    };
+    let discovered_template = (config.chat_template.is_none() && !legacy_model())
         .then(|| resolve_chat_template_file(&config.tokenizer_path, config.revision.as_deref()))
         .flatten();
     let template_source = config
@@ -132,13 +141,10 @@ pub fn select_chat_formatter(
             );
             (Some(formatter), None)
         }
-        Err(error) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            (
-                None,
-                Some(format!("this model has no usable chat template: {error}")),
-            )
-        }
+        Err(error) => (
+            None,
+            Some(format!("this model has no usable chat template: {error}")),
+        ),
     }
 }
 
