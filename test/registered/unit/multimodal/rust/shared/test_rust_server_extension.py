@@ -236,6 +236,113 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(instance.http_port, 30001)
         self.assertTrue(instance._multimodal_enabled)
 
+    def test_gather_server_endpoints_lists_every_listener_by_dp_rank(self):
+        """Every rank joins the collective; only listener ranks contribute an
+        entry, an unspecified bind host is replaced by a reachable one, and
+        the table comes back sorted by DP rank."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [
+                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+                None,
+                obj,
+                None,
+            ]
+
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch.object(
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    nnodes=1,
+                    pp_size=1,
+                    tp_size=2,
+                    tp_rank=0,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    attn_dp_size=2,
+                    attn_dp_rank=0,
+                    dp_rank=0,
+                    world_group=SimpleNamespace(all_gather_object=all_gather_object),
+                ),
+            ),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            patch.object(server_module, "get_local_ip_auto", return_value="10.0.0.1"),
+        ):
+            table = RustServer.gather_server_endpoints(hosts_listener=True)
+            others_only = RustServer.gather_server_endpoints(hosts_listener=False)
+
+        self.assertEqual(
+            gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
+        )
+        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        self.assertEqual(
+            others_only, [{"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}]
+        )
+        self.assertEqual(
+            table,
+            [
+                {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+            ],
+        )
+
+    def test_gather_server_endpoints_warns_on_a_loopback_host_across_nodes(self):
+        """A multi-node launch with a loopback listener and a routable
+        rendezvous is warned about, naming both addresses, and still runs the
+        collective: the nodes may share the machine. A loopback rendezvous
+        (two nodes on one CI host) is not warned about."""
+        all_gather_object = Mock(return_value=[None, None])
+        parallel = SimpleNamespace(
+            nnodes=2,
+            dist_init_addr="10.0.0.1:29500",
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+            ),
+            self.assertLogs(server_module.logger, level="WARNING") as logs,
+        ):
+            self.assertEqual(
+                RustServer.gather_server_endpoints(hosts_listener=False), []
+            )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'127.0.0.1'", logs.output[0])
+        self.assertIn("'10.0.0.1:29500'", logs.output[0])
+
+        parallel.dist_init_addr = "127.0.0.1:29500"
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+            ),
+            patch.object(server_module.logger, "warning") as warning,
+        ):
+            self.assertEqual(
+                RustServer.gather_server_endpoints(hosts_listener=False), []
+            )
+        warning.assert_not_called()
+        self.assertEqual(all_gather_object.call_count, 2)
+
     def test_startup_time_takes_the_engine_shape(self):
         """The frontend's end-to-end phase runs from its process's spawn."""
         server = RustServer(Mock(), http_port=30000)
