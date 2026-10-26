@@ -567,6 +567,18 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
         --port 30000
     ```
 
+* **FP8 dense layers for DeepSeek-style NVFP4 checkpoints:**
+    ModelOpt NVFP4 checkpoints of DeepSeek-style MLA models (DeepSeek-V2/V3/V3.2, GLM-5) quantize only the routed experts and keep the dense layers (attention projections, shared experts, dense MLPs) in BF16. On NVIDIA GPUs, add `--enable-nvfp4-ckpt-fp8-dense` to quantize those BF16 layers to block-FP8 (128x128 block scales) while the model loads, with no separate checkpoint. `lm_head`, `kv_b_proj`, the DSA indexer's `wk` / `weights_proj` and the NextN / MTP draft layer stay in checkpoint precision. The flag has no effect on other models.
+    ```bash Command
+    python3 -m sglang.launch_server \
+        --model-path nvidia/GLM-5.2-NVFP4 \
+        --quantization modelopt_fp4 \
+        --enable-nvfp4-ckpt-fp8-dense \
+        --tp 8 \
+        --trust-remote-code \
+        --port 30000
+    ```
+
 ##### Creating Your Own Quantized Checkpoints
 
 If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.

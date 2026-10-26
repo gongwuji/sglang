@@ -194,6 +194,17 @@ class Model(msgspec.Struct):
             type_parser=nullable_str,
         ),
     ] = None
+    enable_nvfp4_ckpt_fp8_dense: A[
+        bool,
+        (
+            "For ModelOpt NVFP4 checkpoints (modelopt_fp4 / modelopt_mixed) of "
+            "DeepSeek-style MLA models (DeepSeek-V2/V3/V3.2, GLM-5): quantize the linear "
+            "layers the checkpoint leaves in BF16 to block-FP8 (E4M3, 128x128 block "
+            "scales, dynamic per-token-group activations) while loading. lm_head, "
+            "kv_b_proj, the DSA indexer's wk / weights_proj and the NextN / MTP draft "
+            "layer stay in checkpoint precision. No effect on other models."
+        ),
+    ] = False
     kv_cache_dtype: A[
         str,
         Arg(

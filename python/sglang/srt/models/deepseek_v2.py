@@ -144,6 +144,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
     Mxfp8RoutedInputPreQuant,
@@ -3245,6 +3246,17 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+    # Opts the DeepSeek-V2 family (DeepSeek-V2/V3/V3.2, GLM-5) in to
+    # --enable-nvfp4-ckpt-fp8-dense. Kept in checkpoint precision:
+    # - kv_b_proj: post_load_weights copies it into w_kc / w_vc for the absorbed
+    #   MLA bmm before quant methods post-process weights, so the decode and
+    #   long-prefill path stays BF16 either way; converting it would only move
+    #   the short-prefill MHA path to FP8 (two numerics, negligible gain).
+    # - DSA indexer wk / weights_proj (fused into wk_weights_proj on CUDA): the
+    #   fused parameter is BF16 by construction and the loader dequantizes FP8
+    #   wk into it. Excluding wk keeps the unfused path identical, and listing
+    #   all three keeps that true if the indexer starts passing a quant config.
+    online_fp8_exclude_modules = ("kv_b_proj", "wk_weights_proj", "wk", "weights_proj")
     # for quark model load
     packed_modules_mapping = {}
 
@@ -3272,6 +3284,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # checkpoint's source layer names.
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+            if isinstance(quant_config, ModelOptQuantConfig):
+                quant_config.update_online_fp8_exclude_modules(
+                    self.online_fp8_exclude_modules
+                )
 
         self.pp_group = get_parallel().pp_group
         self.config = config
