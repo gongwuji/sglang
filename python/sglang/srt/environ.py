@@ -1106,6 +1106,8 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    # Opt in to DVPP JPEGD + Triton RGB conversion for tensor-capable processors.
+    SGLANG_ENABLE_NPU_IMAGE_DECODE = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time so arch35 (Atlas A5) dense linears run on the native quantized
