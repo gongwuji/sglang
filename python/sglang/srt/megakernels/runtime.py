@@ -311,6 +311,7 @@ class _CaptureCheck:
         if self.is_done or not set(runner.capture_bs) <= set(captured):
             return
         self.is_done = True
+        self.dispatch.binding.seal_capture_buffers(runner)
         self.dispatch.binding.assert_live()
         routed = sorted(bs for bs, step in captured.items() if step is not None)
         if not routed:
