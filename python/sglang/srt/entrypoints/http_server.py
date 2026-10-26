@@ -1930,6 +1930,7 @@ async def openai_v1_audio_transcriptions(
     timestamp_granularities: Optional[List[str]] = Form(
         default=None, alias="timestamp_granularities[]"
     ),
+    task: str = Form(default="transcribe"),
 ):
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
@@ -1953,6 +1954,7 @@ async def openai_v1_audio_transcriptions(
             temperature=temperature,
             stream=stream,
             timestamp_granularities=timestamp_granularities,
+            task=task,
             raw_request=raw_request,
         )
     )
