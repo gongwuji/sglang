@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseAllocatorCacheReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -58,6 +59,7 @@ _CONTROL_REQ_TYPES = (
     UpdateWeightFromTensorReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     GetWeightsChecksumReqInput,
+    ReleaseAllocatorCacheReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
