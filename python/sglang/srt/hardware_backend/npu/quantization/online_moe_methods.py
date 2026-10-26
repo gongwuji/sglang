@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
+)
+from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
+    NPUOnlineMoEWeightLoader,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -58,6 +64,82 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         # AscendRunnerCore.__init__ reads layer.w2_kernel to pick its activation.
         layer.w13_kernel = NPUMXFP8MoEMethod("w13")
         layer.w2_kernel = NPUMXFP8MoEMethod("w2")
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        # Inherited apply() consults this; aiter is CUDA/ROCm-only.
+        self._aiter_runner = None
+
+
+class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Online W4A8 MXFP FusedMoE entry point (``--quantization mxfp_w4a8``).
+
+    W13 and W2 allocate lazily and convert independently as soon as all local
+    shards arrive. The final pass only validates completion; inference keeps
+    using the existing packed MXFP4 kernels and unquantized MoE orchestration.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        load_device = torch.get_default_device()
+        original_loader = extra_weight_attrs["weight_loader"]
+        loader = NPUOnlineMoEWeightLoader(layer, params_dtype, original_loader)
+        # Reuse the unquantized shapes/attributes without allocating the entire
+        # local floating-point model. Ignored layers never enter this subclass.
+        with torch.device("meta"):
+            super().create_weights(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                with_bias=with_bias,
+                **{**extra_weight_attrs, "weight_loader": loader.weight_loader},
+            )
+        if with_bias:
+            for prefix in ("w13", "w2"):
+                name = f"{prefix}_weight_bias"
+                bias = getattr(layer, name)
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(bias, device=load_device), requires_grad=False
+                )
+                materialized.__dict__.update(bias.__dict__)
+                materialized.weight_loader = original_loader
+                setattr(layer, name, materialized)
+        loader.register_sources()
+        layer._npu_online_moe_loader = loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._npu_online_moe_loader.finish_post_load()
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            # Same trap as the MXFP8 entry point: subclassing
+            # UnquantizedFusedMoEMethod puts this method on FusedMoE's shard-swap
+            # list, so a flashinfer backend would load every expert with gate and
+            # up swapped and gmm1 would compute silu(up) * gate silently.
+            raise ValueError(
+                "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
+                f"'ascend', got {backend.value!r}."
+            )
+
+        layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
+        layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)

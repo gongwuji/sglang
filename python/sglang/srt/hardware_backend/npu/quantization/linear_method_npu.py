@@ -54,6 +54,19 @@ def _get_float4_e2m1fn_x2_dtype():
     return getattr(torch, "float4_e2m1fn_x2", None)
 
 
+def _prepare_mxfp4_w4a8_bias(
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match the A8W4 ``npu_quant_matmul`` bias contract."""
+    if bias is None:
+        return None
+    if bias.dtype != torch.bfloat16:
+        bias = bias.to(torch.bfloat16)
+    if bias.dim() == 1:
+        bias = bias.unsqueeze(0)
+    return bias
+
+
 class _NPULinearMethodBase(LinearMethodBase):
     def __init__(
         self,
@@ -447,15 +460,10 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        """Register an unquantized (``params_dtype``) weight placeholder.
-
-        Online quantization needs its own ``create_weights`` because the
-        checkpoint still holds full-precision BF16/FP16 weights: the loader
-        fills this buffer, then ``process_weights_after_loading`` quantizes it to
-        MXFP4 in place. This differs from the offline/int8 methods, whose weights
-        are created by the scheme's own ``create_weights`` to match the
-        already-quantized (FP8 / uint8-packed) layout the checkpoint provides.
-        """
+        """Allocate lazily and convert as soon as the logical weight is loaded."""
+        from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
+            NPUOnlineDenseWeightLoader,
+        )
         from sglang.srt.layers.parameter import ModelWeightParameter
 
         output_size_per_partition = sum(output_partition_sizes)
@@ -466,21 +474,30 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
 
-        # Load weights in original dtype; quantise to MXFP4 in
-        # process_weights_after_loading.
+        loader = NPUOnlineDenseWeightLoader(
+            layer, params_dtype, weight_loader, lambda: self._quantize_weights(layer)
+        )
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
                 dtype=params_dtype,
+                device="meta",
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=loader.weight_loader,
         )
         layer.register_parameter("weight", weight)
+        loader.register_source(weight)
+        layer._npu_online_dense_loader = loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Conversion already happened during loading; never repack a prepared
+        # weight or accept a partially loaded/reloaded floating-point source.
+        layer._npu_online_dense_loader.finish_post_load()
+
+    def _quantize_weights(self, layer: torch.nn.Module) -> None:
         # Online single-level MXFP4 weight quant, then lay the weight out exactly
         # like the offline W4A8 path so the same npu_quant_matmul(x2_dtype=fp4)
         # kernel accepts it. All NPU ops go through torch.ops.npu.* (no torch_npu).
@@ -497,7 +514,11 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         # npu_dynamic_mx_quant returns the scale as [out, in//64, 2] (3D); older
         # builds may return [out, in//32] (2D) — handle both before the transpose.
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            weight_fp, dst_type=fp4_dtype, round_mode="round"
+            weight_fp,
+            dst_type=fp4_dtype,
+            round_mode="rint",
+            scale_alg=2,
+            dst_type_max=7.25,
         )
 
         # weight: packed FP4 -> FRACTAL_NZ (float8_e4m3fn view) -> transpose
@@ -516,17 +537,6 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             n, k = w_scale.shape
             w_scale = w_scale.reshape(n, k // 2, 2)
         layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
-
-        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
-        if (
-            getattr(layer, "bias", None) is not None
-            and layer.bias.dtype != torch.float32
-        ):
-            layer.bias_fp32 = Parameter(
-                layer.bias.data.to(torch.float32), requires_grad=False
-            )
-        else:
-            layer.bias_fp32 = None
 
     def apply(
         self,
@@ -551,17 +561,9 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
-        if bias is None:
-            quant_bias = None
-        elif (
-            bias is getattr(layer, "bias", None)
-            and getattr(layer, "bias_fp32", None) is not None
-        ):
-            quant_bias = layer.bias_fp32
-        else:
-            quant_bias = bias.to(torch.float32)
+        # A8W4 requires BF16 bias with shape [1, out_features]. Qwen3 text
+        # layers normally have no bias; Qwen3.5 vision QKV projections do.
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
         output = torch.ops.npu.npu_quant_matmul(
@@ -673,8 +675,8 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        # Keep the offline path on the same A8W4 bias contract as online.
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
@@ -684,7 +686,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
             pertoken_scale_dtype=e8m0_dtype,
-            bias=bias,
+            bias=quant_bias,
             output_dtype=original_dtype,
             x2_dtype=fp4_dtype,
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
