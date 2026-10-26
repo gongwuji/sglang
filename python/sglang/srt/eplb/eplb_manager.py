@@ -18,6 +18,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.hardware_backend.npu.eplb import get_initial_rebalance_iterations
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
@@ -67,6 +68,19 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
+        # The first window starts empty and uses one layout, so it can be shorter.
+        # Later intervals must cover the full recorder window.
+        self._initial_rebalance_iterations = get_initial_rebalance_iterations(
+            self._rebalance_num_iterations
+        )
+        if self._initial_rebalance_iterations is not None:
+            logger.info(
+                "[NPU EPLB initial learning] first=%d steady=%d window=%d",
+                self._initial_rebalance_iterations,
+                self._rebalance_num_iterations,
+                get_exec().moe.expert_distribution_recorder_buffer_size,
+            )
+
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_end(self):
@@ -88,9 +102,14 @@ class EPLBManager:
     # can be more complex if needed
     def _entrypoint(self):
         while True:
-            for _ in range(self._rebalance_num_iterations):
+            initial = self._initial_rebalance_iterations
+            for _ in range(initial or self._rebalance_num_iterations):
                 yield
 
+            # Do not repeat the initial period if rebalance() skips this round.
+            self._initial_rebalance_iterations = None
+            if initial is not None:
+                logger.info("[NPU EPLB initial learning] initial period complete")
             yield from self.rebalance()
 
     def rebalance(self):
