@@ -80,12 +80,17 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "not support "
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
         )
+    # KV sharding defaults to Python even when the general tree default is Rust.
+    # Preserve an explicit backend choice for validation below.
+    if not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.set("python")
     tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
     # A disabled radix cache never matches or inserts, so its tree core never
     # sees a rotation base; chunked continuations keep the base on the request.
-    if not cfg.disable_radix_cache and tree_core_backend != "python":
+    if not cfg.disable_radix_cache and tree_core_backend not in ("python", "rust"):
         raise ValueError(
-            "--enable-kv-cache-sharding requires the Python UnifiedTreeCore: "
+            "--enable-kv-cache-sharding requires a rotation-aware "
+            "UnifiedTreeCore: "
             f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={tree_core_backend!r} is "
             "not supported for sharded KV."
         )
