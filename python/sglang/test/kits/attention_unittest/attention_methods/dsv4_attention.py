@@ -17,8 +17,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-from torch import nn
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -37,6 +35,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.kernels.deepseek_v4.k_cache_reference import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from torch import nn
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -1667,6 +1666,8 @@ def run_dsv4_compress_attention_case(
         torch.no_grad(),
         forward_context(ForwardContext(attn_backend=fixture.backend)),
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(sparse_prefill),
+        envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW.override(0),
+        envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH.override(0),
     ):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         _seed_c4_if_needed(fixture, num_entries=extra_entries)
